@@ -217,6 +217,9 @@
             <button onclick="switchTab('home')" id="nav-home" class="nav-btn px-2 sm:px-3 py-1.5 rounded-full whitespace-nowrap bg-black text-white">Home</button>
             <button onclick="switchTab('history')" id="nav-history" class="nav-btn px-2 sm:px-3 py-1.5 rounded-full whitespace-nowrap text-black hover:bg-gray-100">History</button>
             <button onclick="switchTab('account')" id="nav-account" class="hidden nav-btn px-2 sm:px-3 py-1.5 rounded-full whitespace-nowrap text-black hover:bg-gray-100">Account</button>
+            <button onclick="logoutApp()" id="logout-btn" class="nav-btn w-8 h-8 rounded-full flex items-center justify-center text-black hover:bg-gray-100 shrink-0" title="Log out">
+                <i class="fa-solid fa-right-from-bracket"></i>
+            </button>
         </div>
 
         <div id="connection-pill" class="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full border-2 border-black text-[11px] font-black bg-gray-100 shrink-0 whitespace-nowrap">
@@ -353,6 +356,12 @@
         <button onclick="lockAdmin()" class="w-full py-3 rounded-xl bg-red-600 text-white font-black text-xs uppercase border-2 border-black shadow-comic-sm">
             <i class="fa-solid fa-lock mr-2"></i> Lock Admin Mode
         </button>
+        <p class="text-[10px] font-semibold text-gray-600 text-center">Locks editing but keeps the ledger visible on this device.</p>
+
+        <button onclick="logoutApp()" class="w-full py-3 rounded-xl comic-btn-white font-black text-xs uppercase">
+            <i class="fa-solid fa-right-from-bracket mr-2"></i> Logout
+        </button>
+        <p class="text-[10px] font-semibold text-gray-600 text-center">Hides the ledger completely — the site password will be required again.</p>
     </div>
 </section>
 
@@ -726,6 +735,22 @@ window.lockAdmin = function() {
     applyAdminUI();
     executeSwitchTab("home");
     renderUI();
+};
+
+window.logoutApp = function() {
+    if (!confirm("Log out? You'll need the site password again to see the ledger.")) return;
+
+    // Logging out also drops admin mode, so the next person who opens
+    // this device has to unlock both the site and admin from scratch.
+    isAdmin = false;
+    localStorage.removeItem("alpha_ledger_admin");
+    applyAdminUI();
+    executeSwitchTab("home");
+
+    enteredSitePin = "";
+    updateSitePinDots();
+    document.getElementById("site-auth-error").innerText = "";
+    document.getElementById("site-password-screen").classList.remove("hidden");
 };
 
 window.changeAdminCode = async function(event) {
