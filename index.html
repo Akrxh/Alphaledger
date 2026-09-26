@@ -339,7 +339,7 @@
 
         <div class="space-y-3">
             <h3 class="manga-title text-xl uppercase">Change Admin Code</h3>
-            <p class="text-[10px] font-semibold text-gray-600">This changes the hidden admin code used to unlock editing on this device.</p>
+            <p class="text-[10px] font-semibold text-gray-600">This changes the hidden admin code for every device — anyone unlocking admin mode from now on needs the new code.</p>
             <form onsubmit="changeAdminCode(event)" class="space-y-3">
                 <input type="password" id="input-new-admin-code" required maxlength="6" pattern="\d{6}" inputmode="numeric" class="w-full rounded-xl px-3 py-2.5 font-bold text-sm bg-gray-50" placeholder="New 6-digit admin code">
                 <input type="password" id="input-new-admin-code-confirm" required maxlength="6" pattern="\d{6}" inputmode="numeric" class="w-full rounded-xl px-3 py-2.5 font-bold text-sm bg-gray-50" placeholder="Confirm new admin code">
@@ -425,16 +425,20 @@ const db = getFirestore(app);
 const APP_DOC_REF = doc(db, "app", "main");
 const TEACHERS_COL = collection(db, "app", "main", "teachers");
 const HISTORY_COL = collection(db, "app", "main", "history");
+const ADMIN_DOC_REF = doc(db, "app", "security"); // holds the shared admin code
 
 const SITE_PASSWORD = "260885";           // required every time the page is opened
-const DEFAULT_ADMIN_CODE = "111111";      // default hidden admin code (change it from Account > Change Admin Code)
+const DEFAULT_ADMIN_CODE = "111111";      // used only until the admin code is changed for the first time
 
 /* =========================================================
    STATE
    ========================================================= */
 
+// isAdmin (unlocked/locked) stays per-device — each device still has to
+// enter the code once. The code itself, though, is shared: it lives in
+// Firestore so that changing it applies to every device that signs in.
 let isAdmin = localStorage.getItem("alpha_ledger_admin") === "1";
-let adminCode = localStorage.getItem("alpha_ledger_admin_code") || DEFAULT_ADMIN_CODE;
+let adminCode = DEFAULT_ADMIN_CODE;
 
 let enteredSitePin = "";
 let enteredAdminPin = "";
@@ -450,9 +454,18 @@ let dbJson = {
         classStream: "Class 11 • Science Stream",
         avatar: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150"
     },
+    security: {
+        code: DEFAULT_ADMIN_CODE
+    },
     teachers: [],
     history: []
 };
+
+// Keeps the in-memory adminCode in sync with whatever is cached in dbJson
+// (from IndexedDB and/or the last Firestore sync).
+function syncAdminCodeFromState() {
+    adminCode = (dbJson.security && dbJson.security.code) || DEFAULT_ADMIN_CODE;
+}
 
 let offlineQueue = [];
 
@@ -573,6 +586,9 @@ async function executeCloudAction(action) {
             break;
         case "SAVE_PROFILE":
             await setDoc(APP_DOC_REF, action.data, { merge: true });
+            break;
+        case "SET_ADMIN_CODE":
+            await setDoc(ADMIN_DOC_REF, action.data, { merge: true });
             break;
         case "ADD_HISTORY":
             await setDoc(doc(HISTORY_COL, action.data.id), action.data);
@@ -712,8 +728,10 @@ window.lockAdmin = function() {
     renderUI();
 };
 
-window.changeAdminCode = function(event) {
+window.changeAdminCode = async function(event) {
     event.preventDefault();
+    if (!isAdmin) return;
+
     const a = document.getElementById("input-new-admin-code").value.trim();
     const b = document.getElementById("input-new-admin-code-confirm").value.trim();
     const error = document.getElementById("admin-code-change-error");
@@ -721,12 +739,22 @@ window.changeAdminCode = function(event) {
     if (!/^\d{6}$/.test(a)) { error.innerText = "Enter exactly 6 digits."; return; }
     if (a !== b) { error.innerText = "Codes do not match."; return; }
 
+    dbJson.security = { code: a };
     adminCode = a;
-    localStorage.setItem("alpha_ledger_admin_code", a);
+    await saveJSONToDisk();
+
     error.innerText = "";
     document.getElementById("input-new-admin-code").value = "";
     document.getElementById("input-new-admin-code-confirm").value = "";
-    alert("Admin code updated on this device.");
+
+    const synced = await cloudWrite({ type: "SET_ADMIN_CODE", data: { code: a } });
+    await saveJSONToDisk();
+
+    alert(
+        synced
+            ? "Admin code updated — it now applies on every device."
+            : "Admin code updated on this device. It's queued to sync to every other device once you're back online."
+    );
 };
 
 function applyAdminUI() {
@@ -743,6 +771,7 @@ function applyAdminUI() {
 async function initializeAppSession() {
     applyAdminUI();
     await loadJSONFromDisk();
+    syncAdminCodeFromState();
     if (navigator.onLine) {
         await syncAndRefresh();
     } else {
@@ -780,6 +809,12 @@ async function syncAndRefresh() {
             dbJson.history.push({ id: snapshot.id, ...snapshot.data() });
         });
         dbJson.history.sort((a, b) => String(b.id).localeCompare(String(a.id)));
+
+        const adminSnapshot = await getDoc(ADMIN_DOC_REF);
+        if (adminSnapshot.exists() && adminSnapshot.data().code) {
+            dbJson.security = { code: adminSnapshot.data().code };
+        }
+        syncAdminCodeFromState();
 
         await saveJSONToDisk();
         updateConnectionStatus("online", "Online");
