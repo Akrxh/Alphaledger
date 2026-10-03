@@ -106,6 +106,16 @@
         .pin-dot.filled { background:#000; }
 
         #admin-badge.hidden, #nav-account.hidden, #add-teacher-fab.hidden { display:none !important; }
+
+        /* Monthly fee status dot (small, flat, like the Online tag dot) */
+        .fee-circle {
+            position:relative; width:12px; height:12px; border-radius:50%;
+            border:none; box-shadow:none; padding:0; flex-shrink:0;
+        }
+        .fee-circle::after { content:""; position:absolute; inset:-10px; } /* bigger tap area */
+        .fee-circle.due { background:#eab308; }
+        .fee-circle.paid { background:#16a34a; }
+        .fee-circle:disabled { cursor:default; }
     </style>
 </head>
 
@@ -193,6 +203,17 @@
             <button onclick="cancelCrop()" class="flex-1 py-2 rounded-xl comic-btn-white font-black text-xs uppercase">Cancel</button>
             <button onclick="confirmCrop()" class="flex-1 py-2 rounded-xl comic-btn font-black text-xs uppercase">Crop & Save</button>
         </div>
+    </div>
+</div>
+
+<!-- =========================================================
+     MONTHLY FEE REMINDER
+     ========================================================= -->
+<div id="fee-reminder-modal" class="fixed inset-0 z-[60] modal-backdrop flex items-center justify-center p-4 hidden">
+    <div class="comic-panel rounded-2xl p-6 max-w-sm w-full bg-white animate-pop space-y-4">
+        <h3 class="manga-title text-2xl uppercase"><i class="fa-solid fa-bell"></i> New Month!</h3>
+        <ul id="fee-reminder-list" class="space-y-2 text-sm font-black"></ul>
+        <button onclick="dismissFeeReminder()" class="w-full py-2.5 rounded-xl comic-btn font-black text-xs uppercase">Got it</button>
     </div>
 </div>
 
@@ -435,6 +456,7 @@ const APP_DOC_REF = doc(db, "app", "main");
 const TEACHERS_COL = collection(db, "app", "main", "teachers");
 const HISTORY_COL = collection(db, "app", "main", "history");
 const ADMIN_DOC_REF = doc(db, "app", "security"); // holds the shared admin code
+const BILLING_DOC_REF = doc(db, "app", "billing"); // remembers which month was last reset
 
 const SITE_PASSWORD = "260885";           // required every time the page is opened
 const DEFAULT_ADMIN_CODE = "111111";      // used only until the admin code is changed for the first time
@@ -598,6 +620,12 @@ async function executeCloudAction(action) {
             break;
         case "SET_ADMIN_CODE":
             await setDoc(ADMIN_DOC_REF, action.data, { merge: true });
+            break;
+        case "RESET_ALL_TEACHERS":
+            await Promise.allSettled(action.data.ids.map(id =>
+                updateDoc(doc(TEACHERS_COL, id), { status: "due", paidDate: null, paidCycle: null })
+            ));
+            await setDoc(BILLING_DOC_REF, { lastResetCycle: action.data.cycle }, { merge: true });
             break;
         case "ADD_HISTORY":
             await setDoc(doc(HISTORY_COL, action.data.id), action.data);
@@ -790,6 +818,80 @@ function applyAdminUI() {
 }
 
 /* =========================================================
+   MONTHLY FEE TRACKER
+   ========================================================= */
+
+function currentCycle() {
+    const d = new Date();
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+}
+
+// Which month a payment belongs to. Older entries without paidCycle
+// are matched using their saved paidDate.
+function cycleOfPaid(t) {
+    if (t.paidCycle) return t.paidCycle;
+    const d = new Date(t.paidDate);
+    return isNaN(d) ? null : d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+}
+
+// Auto-reset: the first time the app loads in a new month, EVERY tuition goes
+// back to yellow (Payment Due) at once. A shared marker in Firestore
+// (app/billing.lastResetCycle) makes sure it happens once per month for all devices.
+// History is never touched.
+async function runMonthlyReset() {
+    if (!navigator.onLine) return; // needs the shared marker, so only runs online
+    const cycle = currentCycle();
+    const marker = dbJson.billing && dbJson.billing.lastResetCycle;
+    if (marker && marker >= cycle) return; // this month already reset
+
+    const teachers = dbJson.teachers || [];
+    // First ever run (no marker yet): only clear payments from earlier months.
+    // Otherwise (marker is an earlier month): reset every tuition.
+    const targets = marker
+        ? teachers
+        : teachers.filter(t => t.status === "paid" && cycleOfPaid(t) !== cycle);
+
+    targets.forEach(t => { t.status = "due"; t.paidDate = null; t.paidCycle = null; });
+    dbJson.billing = { lastResetCycle: cycle };
+    await saveJSONToDisk();
+    await cloudWrite({ type: "RESET_ALL_TEACHERS", data: { ids: targets.map(t => t.id), cycle } });
+    await saveJSONToDisk();
+}
+
+// Alert: shown once per month, the first time the app is opened that month.
+function showFeeReminder() {
+    const cycle = currentCycle();
+    if (localStorage.getItem("alpha_ledger_alerted") === cycle) return;
+    const due = (dbJson.teachers || []).filter(t => t.status !== "paid");
+    if (!due.length) return;
+    document.getElementById("fee-reminder-list").innerHTML = due.map(t =>
+        `<li class="border-2 border-black rounded-lg p-2 bg-yellow-100">Pay the fees of ${escapeHtml(t.name)}</li>`
+    ).join("");
+    document.getElementById("fee-reminder-modal").classList.remove("hidden");
+}
+
+window.dismissFeeReminder = function() {
+    localStorage.setItem("alpha_ledger_alerted", currentCycle());
+    document.getElementById("fee-reminder-modal").classList.add("hidden");
+};
+
+// Circle checkbox: Yellow <-> Green
+window.toggleFee = function(id) {
+    const t = dbJson.teachers.find(x => x.id === id);
+    if (!t) return;
+    return t.status === "paid" ? window.undoPayment(id) : window.markAsPaid(id);
+};
+
+// Keeps working if the page stays open past midnight on the 1st
+setInterval(async () => {
+    if (document.getElementById("site-password-screen").classList.contains("hidden")) {
+        await runMonthlyReset();
+        renderUI();
+        showFeeReminder();
+    }
+}, 60 * 60 * 1000);
+
+/* =========================================================
    APP SESSION
    ========================================================= */
 
@@ -800,9 +902,11 @@ async function initializeAppSession() {
     if (navigator.onLine) {
         await syncAndRefresh();
     } else {
+        await runMonthlyReset();
         updateConnectionStatus("offline", "Offline");
         renderUI();
     }
+    showFeeReminder();
 }
 
 async function syncAndRefresh() {
@@ -840,6 +944,11 @@ async function syncAndRefresh() {
             dbJson.security = { code: adminSnapshot.data().code };
         }
         syncAdminCodeFromState();
+
+        const billingSnapshot = await getDoc(BILLING_DOC_REF);
+        dbJson.billing = billingSnapshot.exists() ? billingSnapshot.data() : {};
+
+        await runMonthlyReset();
 
         await saveJSONToDisk();
         updateConnectionStatus("online", "Online");
@@ -1037,9 +1146,7 @@ function renderTeachers() {
         dueList.innerHTML = due.map(teacher => `
             <div class="comic-panel rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                 <div class="flex items-center space-x-3 min-w-0">
-                    <div class="w-10 h-10 rounded-lg border-2 border-black bg-gray-100 flex items-center justify-center font-black shrink-0">
-                        <i class="fa-solid fa-chalkboard-user"></i>
-                    </div>
+                    <button onclick="toggleFee('${teacher.id}')" ${isAdmin ? "" : "disabled"} title="Mark as paid" class="fee-circle due"></button>
                     <div class="min-w-0">
                         <h4 class="font-black text-sm sm:text-base truncate">${escapeHtml(teacher.name)}</h4>
                         <span class="text-xs font-extrabold text-red-600">Due: ₹${Number(teacher.amount).toLocaleString("en-IN")}</span>
@@ -1063,9 +1170,7 @@ function renderTeachers() {
         paidList.innerHTML = paid.map(teacher => `
             <div class="comic-panel rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                 <div class="flex items-center space-x-3 min-w-0">
-                    <div class="w-10 h-10 rounded-lg border-2 border-black bg-white flex items-center justify-center font-black shrink-0">
-                        <i class="fa-solid fa-receipt"></i>
-                    </div>
+                    <button onclick="toggleFee('${teacher.id}')" ${isAdmin ? "" : "disabled"} title="Undo payment" class="fee-circle paid"></button>
                     <div class="min-w-0">
                         <h4 class="font-black text-sm sm:text-base truncate">${escapeHtml(teacher.name)}</h4>
                         <span class="text-xs font-bold text-gray-700">Paid: ₹${Number(teacher.amount).toLocaleString("en-IN")} • ${teacher.paidDate || ""}</span>
@@ -1125,6 +1230,7 @@ window.markAsPaid = async function(id) {
 
     teacher.status = "paid";
     teacher.paidDate = paidDate;
+    teacher.paidCycle = currentCycle();
 
     const historyId = "h_" + Date.now() + "_" + crypto.randomUUID();
     const historyItem = {
@@ -1143,7 +1249,7 @@ window.markAsPaid = async function(id) {
     await saveJSONToDisk();
     renderUI();
 
-    await cloudWrite({ type: "UPDATE_TEACHER", data: { id: teacher.id, payload: { status: "paid", paidDate } } });
+    await cloudWrite({ type: "UPDATE_TEACHER", data: { id: teacher.id, payload: { status: "paid", paidDate, paidCycle: teacher.paidCycle } } });
     await cloudWrite({ type: "ADD_HISTORY", data: historyItem });
 
     await saveJSONToDisk();
@@ -1160,11 +1266,12 @@ window.undoPayment = async function(id) {
 
     teacher.status = "due";
     teacher.paidDate = null;
+    teacher.paidCycle = null;
 
     await saveJSONToDisk();
     renderUI();
 
-    await cloudWrite({ type: "UPDATE_TEACHER", data: { id, payload: { status: "due", paidDate: null } } });
+    await cloudWrite({ type: "UPDATE_TEACHER", data: { id, payload: { status: "due", paidDate: null, paidCycle: null } } });
     await saveJSONToDisk();
 };
 
@@ -1188,7 +1295,7 @@ window.addTeacherEntry = async function(event) {
     const fee = Number(document.getElementById("teacher-fee").value);
     const newId = "t_" + Date.now() + "_" + Math.random().toString(36).slice(2);
 
-    const teacher = { id: newId, name, amount: fee, status: "due", paidDate: null, createdAt: new Date().toISOString() };
+    const teacher = { id: newId, name, amount: fee, status: "due", paidDate: null, paidCycle: null, createdAt: new Date().toISOString() };
 
     dbJson.teachers.push(teacher);
     await saveJSONToDisk();
